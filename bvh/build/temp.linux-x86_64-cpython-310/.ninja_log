@@ -1,0 +1,5 @@
+# ninja log v7
+0	7359	1756222406951072010	/home/pj/Desktop/data/tron_future_3dgic/bvh/build/temp.linux-x86_64-cpython-310/home/pj/Desktop/data/tron_future_3dgic/bvh/src/trace.o	6d438cfbef06c63c
+0	7992	1756222406951072010	/home/pj/Desktop/data/tron_future_3dgic/bvh/build/temp.linux-x86_64-cpython-310/home/pj/Desktop/data/tron_future_3dgic/bvh/src/construct.o	febf7399282fb9bb
+0	9319	1756222406951072010	/home/pj/Desktop/data/tron_future_3dgic/bvh/build/temp.linux-x86_64-cpython-310/home/pj/Desktop/data/tron_future_3dgic/bvh/src/bindings.o	eeb81527b5943dd8
+0	24008	1756222406951072010	/home/pj/Desktop/data/tron_future_3dgic/bvh/build/temp.linux-x86_64-cpython-310/home/pj/Desktop/data/tron_future_3dgic/bvh/src/bvh.o	55433b7b69b1d397
