@@ -1,0 +1,17 @@
+{
+  "defaults": {
+    "top_k_ref_views": 3,
+    "simple_lama_device": "cuda",
+    "mask_threshold": 0,
+    "mask_dilation": 0,
+    "intersect_top_m": 20,
+    "intersect_cache_size": 256,
+    "background_id": 0,
+    "finetune_iteration": 5000
+  },
+  "removal_config_template": "../object_removal/bear.json",
+  "inpaint_config_template": "../object_inpaint/bear_new.json",
+  "rounds": [
+    { "target_id": [12,25,38,51,63,76] }
+  ]
+}
