@@ -132,6 +132,47 @@ def load_mask(mask_file):
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".PNG", ".JPG", ".JPEG", ".TIF", ".TIFF")
 
 
+def _split_name_keys(name):
+    stripped = str(name).strip()
+    if not stripped:
+        return set()
+
+    basename = os.path.basename(stripped)
+    stem = Path(basename).stem
+    return {stripped, basename, stem}
+
+
+def _read_split_list(list_path):
+    split_names = set()
+    with open(list_path, "r") as file:
+        for line in file:
+            item = line.strip()
+            if not item or item.startswith("#"):
+                continue
+            split_names.update(_split_name_keys(item))
+    return split_names
+
+
+def _name_in_split(image_name, split_names):
+    return bool(_split_name_keys(image_name) & split_names)
+
+
+def _image_index_from_name(image_name):
+    stem = Path(os.path.basename(str(image_name))).stem
+    try:
+        return int(stem)
+    except ValueError:
+        match = re.search(r"(\d+)$", stem)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _is_mod8_test_image(image_name):
+    image_index = _image_index_from_name(image_name)
+    return image_index is not None and image_index % 8 == 0
+
+
 def _find_by_stem(folder, stem, extensions=IMAGE_EXTENSIONS):
     if not folder or not stem:
         return None
@@ -295,7 +336,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, objects_fol
         image_path = _first_existing([os.path.join(images_folder, image_basename)])
         if image_path is None:
             image_path = _find_by_stem(images_folder, image_stem)
-        if image_path is None:
+        if image_path is None and Path(images_folder).name != "substitude":
             image_path = _find_sidecar(images_folder, ["frame_{0:05d}".format(idx + 1), "{0:05d}".format(idx)])
         # print(image_path)
         # print(images_folder)
@@ -506,19 +547,35 @@ def readColmapSceneInfo(path, images, eval, object_path, llffhold=8, debug=False
                                            debug=debug)
     cam_infos = sorted(cam_infos_unsorted.copy(), key=lambda x: x.image_name)
 
-    # print(eval)
-    # input()
-
-    if "DTU" in path and not debug:
-        test_indexes = [2, 12, 17, 30, 34]
-        train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx not in test_indexes]
-        test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx in test_indexes]
-    # elif eval and not debug:
-    #     train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
-    #     test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
+    if eval:
+        train_list_path = os.path.join(path, "train_list.txt")
+        test_list_path = os.path.join(path, "test_list.txt")
+        if os.path.exists(train_list_path) and os.path.exists(test_list_path):
+            print("COLMAP split: using train_list.txt and test_list.txt")
+            train_split_names = _read_split_list(train_list_path)
+            test_split_names = _read_split_list(test_list_path)
+            train_cam_infos = [c for c in cam_infos if _name_in_split(c.image_name, train_split_names)]
+            test_cam_infos = [c for c in cam_infos if _name_in_split(c.image_name, test_split_names)]
+            if not train_cam_infos:
+                raise ValueError(f"No COLMAP cameras matched {train_list_path}.")
+            if not test_cam_infos:
+                raise ValueError(f"No COLMAP cameras matched {test_list_path}.")
+        else:
+            print("COLMAP split: train_list.txt/test_list.txt not found; using basename index % 8 == 0 as test")
+            test_cam_infos = [c for c in cam_infos if _is_mod8_test_image(c.image_name)]
+            train_cam_infos = [c for c in cam_infos if not _is_mod8_test_image(c.image_name)]
+            if not test_cam_infos:
+                print("Warning: no numeric basename matched index % 8 == 0; test set is empty.")
     else:
         train_cam_infos = cam_infos
         test_cam_infos = []
+
+    if not train_cam_infos:
+        raise ValueError("No COLMAP training cameras after train/test split.")
+    if eval:
+        print(f"COLMAP split: {len(train_cam_infos)} train cameras, {len(test_cam_infos)} test cameras")
+    else:
+        print(f"COLMAP split disabled: {len(train_cam_infos)} train cameras, {len(test_cam_infos)} test cameras")
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 

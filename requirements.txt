@@ -53,6 +53,7 @@ ptyprocess==0.7.0
 pure_eval==0.2.3
 Pygments==2.19.2
 pyparsing==3.2.3
+pytorch-fid==0.3.0
 python-dateutil==2.9.0.post0
 r3dg_rasterization @ file:///home/pj/Desktop/data/tron_future_3dgic/r3dg-rasterization
 scikit-image==0.25.2

@@ -31,7 +31,7 @@ class Scene:
         self.loaded_iter = None
         self.gaussians = gaussians
 
-        if load_iteration:
+        if load_iteration is not None:
             if load_iteration == -1:
                 self.loaded_iter = searchForMaxIteration(os.path.join(self.model_path, "point_cloud"))
             else:
@@ -58,7 +58,7 @@ class Scene:
         # print(len(scene_info.train_cameras))
         # input()
 
-        if not self.loaded_iter:
+        if self.loaded_iter is None:
             with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply"),
                                                                    'wb') as dest_file:
                 dest_file.write(src_file.read())
@@ -73,7 +73,7 @@ class Scene:
             with open(os.path.join(self.model_path, "cameras.json"), 'w') as file:
                 json.dump(json_cams, file)
                 
-        if self.loaded_iter:
+        if self.loaded_iter is not None:
             if isinstance(self.loaded_iter,str):
                 print("edit load path", self.loaded_iter)
                 self.gaussians.load_ply(os.path.join(self.model_path,

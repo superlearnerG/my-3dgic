@@ -27,6 +27,62 @@ from sklearn.decomposition import PCA
 from PIL import Image
 
 
+EVAL_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
+
+
+def _to_float(value):
+    if torch.is_tensor(value):
+        return float(value.detach().cpu().item())
+    return float(value)
+
+
+def _calculate_fid(gt_dir, render_dir, batch_size=8):
+    try:
+        from pytorch_fid.fid_score import calculate_fid_given_paths
+    except ImportError as exc:
+        raise ImportError(
+            "FID computation requires the PyPI package 'pytorch-fid' "
+            "(import name: pytorch_fid). Install it with: python -m pip install pytorch-fid"
+        ) from exc
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    try:
+        return calculate_fid_given_paths([gt_dir, render_dir], batch_size, device, 2048, 8)
+    except TypeError:
+        return calculate_fid_given_paths([gt_dir, render_dir], batch_size, device, 2048)
+
+
+def ensure_eval_dependencies(scene):
+    if not scene.getTestCameras():
+        return
+    try:
+        from pytorch_fid.fid_score import calculate_fid_given_paths  # noqa: F401
+    except ImportError as exc:
+        raise ImportError(
+            "Vanilla test evaluation requires the PyPI package 'pytorch-fid' "
+            "(import name: pytorch_fid). Install it with: python -m pip install pytorch-fid"
+        ) from exc
+
+
+def write_evaluation_results(model_path, metrics, num_test_views, eval_dir):
+    result_path = os.path.join(model_path, "evaluation_results.txt")
+    with open(result_path, "w") as f:
+        f.write("Vanilla 3DGS test evaluation\n")
+        f.write(f"num_test_views: {num_test_views}\n")
+        f.write(f"eval_dir: {eval_dir}\n")
+        if metrics is None:
+            f.write("status: skipped_no_test_cameras\n")
+            return
+        for key in ("PSNR", "SSIM", "LPIPS", "FID"):
+            f.write(f"{key}: {metrics[key]:.7f}\n")
+
+
+def clear_eval_image_dir(directory):
+    for filename in os.listdir(directory):
+        if os.path.splitext(filename)[1].lower() in EVAL_IMAGE_EXTENSIONS:
+            os.remove(os.path.join(directory, filename))
+
+
 def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams, is_pbr=False, save_iteration=[1_000, 7_000, 30_000, 60_000]):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -36,6 +92,8 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
     """
     gaussians = GaussianModel(dataset.sh_degree, render_type=args.type)
     scene = Scene(dataset, gaussians)
+    if dataset.eval:
+        ensure_eval_dependencies(scene)
     if args.checkpoint:
         print("Create Gaussians from checkpoint {}".format(args.checkpoint))
         first_iter = gaussians.create_from_ckpt(args.checkpoint, restore_optimizer=True)
@@ -456,8 +514,13 @@ def eval_render(scene, gaussians, render_fn, pipe, background, opt, pbr_kwargs, 
     ssim_test = 0.0
     lpips_test = 0.0
     test_cameras = scene.getTestCameras()
-    os.makedirs(os.path.join(args.model_path, 'eval', 'render'), exist_ok=True)
-    os.makedirs(os.path.join(args.model_path, 'eval', 'gt'), exist_ok=True)
+    eval_dir = os.path.join(args.model_path, 'eval')
+    render_dir = os.path.join(eval_dir, 'render')
+    gt_dir = os.path.join(eval_dir, 'gt')
+    os.makedirs(render_dir, exist_ok=True)
+    os.makedirs(gt_dir, exist_ok=True)
+    clear_eval_image_dir(render_dir)
+    clear_eval_image_dir(gt_dir)
     os.makedirs(os.path.join(args.model_path, 'eval', 'normal'), exist_ok=True)
     os.makedirs(os.path.join(args.model_path, 'eval', 'seg_object'), exist_ok=True)
 
@@ -469,6 +532,11 @@ def eval_render(scene, gaussians, render_fn, pipe, background, opt, pbr_kwargs, 
         os.makedirs(os.path.join(args.model_path, 'eval', 'local'), exist_ok=True)
         os.makedirs(os.path.join(args.model_path, 'eval', 'global'), exist_ok=True)
         os.makedirs(os.path.join(args.model_path, 'eval', 'visibility'), exist_ok=True)
+
+    if not test_cameras:
+        write_evaluation_results(args.model_path, None, 0, eval_dir)
+        print("\n[Vanilla Eval] No test cameras found; skipping PSNR/SSIM/LPIPS/FID evaluation.")
+        return
 
     progress_bar = tqdm(range(0, len(test_cameras)), desc="Evaluating",
                         initial=0, total=len(test_cameras))
@@ -489,8 +557,8 @@ def eval_render(scene, gaussians, render_fn, pipe, background, opt, pbr_kwargs, 
             ssim_test += ssim(image, gt_image).mean().double()
             lpips_test += lpips(image, gt_image, net_type='vgg').mean().double()
 
-            save_image(image, os.path.join(args.model_path, 'eval', "render", f"{viewpoint.image_name}.png"))
-            save_image(gt_image, os.path.join(args.model_path, 'eval', "gt", f"{viewpoint.image_name}.png"))
+            save_image(image, os.path.join(render_dir, f"{viewpoint.image_name}.png"))
+            save_image(gt_image, os.path.join(gt_dir, f"{viewpoint.image_name}.png"))
             save_image(results["normal"] * 0.5 + 0.5,
                        os.path.join(args.model_path, 'eval', "normal", f"{viewpoint.image_name}.png"))
 
@@ -519,12 +587,22 @@ def eval_render(scene, gaussians, render_fn, pipe, background, opt, pbr_kwargs, 
     psnr_test /= len(test_cameras)
     ssim_test /= len(test_cameras)
     lpips_test /= len(test_cameras)
+    torch.cuda.empty_cache()
+    fid_test = _calculate_fid(gt_dir, render_dir)
+    metrics = {
+        "PSNR": _to_float(psnr_test),
+        "SSIM": _to_float(ssim_test),
+        "LPIPS": _to_float(lpips_test),
+        "FID": _to_float(fid_test),
+    }
     with open(os.path.join(args.model_path, 'eval', "eval.txt"), "w") as f:
-        f.write(f"psnr: {psnr_test}\n")
-        f.write(f"ssim: {ssim_test}\n")
-        f.write(f"lpips: {lpips_test}\n")
-    print("\n[ITER {}] Evaluating {}: PSNR {} SSIM {} LPIPS {}".format(args.iterations, "test", psnr_test, ssim_test,
-                                                                       lpips_test))
+        f.write(f"psnr: {metrics['PSNR']:.7f}\n")
+        f.write(f"ssim: {metrics['SSIM']:.7f}\n")
+        f.write(f"lpips: {metrics['LPIPS']:.7f}\n")
+        f.write(f"fid: {metrics['FID']:.7f}\n")
+    write_evaluation_results(args.model_path, metrics, len(test_cameras), eval_dir)
+    print("\n[ITER {}] Evaluating {}: PSNR {:.7f} SSIM {:.7f} LPIPS {:.7f} FID {:.7f}".format(
+        args.iterations, "test", metrics["PSNR"], metrics["SSIM"], metrics["LPIPS"], metrics["FID"]))
 
 
 if __name__ == "__main__":

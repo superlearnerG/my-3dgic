@@ -21,6 +21,7 @@ import numpy as np
 from PIL import Image
 import colorsys
 import json
+from collections import OrderedDict
 
 import cv2
 from sklearn.decomposition import PCA
@@ -35,9 +36,31 @@ from scene.gamma_trans import LearningGammaTransform
 from scene.derect_light_sh import DirectLightEnv
 
 
+DEFAULT_INTERSECT_CACHE_SIZE = 256
+DEFAULT_INTERSECT_TOP_M = 20
+
+
 def _output_stem(image_name, fallback_idx):
     stem = os.path.splitext(os.path.basename(str(image_name)))[0]
     return stem if stem else "{0:05d}".format(fallback_idx)
+
+
+def _normalize_object_ids(object_ids):
+    if isinstance(object_ids, torch.Tensor):
+        return [int(item) for item in object_ids.detach().cpu().reshape(-1).tolist()]
+    if isinstance(object_ids, (list, tuple, set)):
+        return [int(item) for item in object_ids]
+    return [int(object_ids)]
+
+
+def object_id_mask(labels, object_ids):
+    ids = _normalize_object_ids(object_ids)
+    if torch.is_tensor(labels):
+        mask = torch.zeros_like(labels, dtype=torch.bool)
+        for object_id in ids:
+            mask = torch.logical_or(mask, labels == object_id)
+        return mask
+    return np.isin(np.asarray(labels), ids)
 
 
 def points_inside_convex_hull(point_cloud, mask, remove_outliers=True, outlier_factor=1.0):
@@ -298,7 +321,99 @@ def get_init_points(cam, image,mask,default_depth=False):
     # del depth, gt_image
     return points
 
-def find_intersect_mask(mask_input, viewpoint_cam, views, select_obj_id, id_now, original_gaussians, is_pbr, pipeline, background, opt, pbr_kwargs, classifier):
+
+def build_intersect_source_entry(view, select_obj_id, original_gaussians, is_pbr, pipeline, background, opt, pbr_kwargs, classifier):
+    if is_pbr:
+        render = render_fn_dict["neilf"]
+    else:
+        render = render_fn_dict["render"]
+
+    if view.objects is None:
+        if is_pbr:
+            original_results = render(view, original_gaussians, pipeline, background, opt=opt, is_training=False, dict_params=pbr_kwargs)
+        else:
+            original_results = render(view, original_gaussians, pipeline, background)
+        original_rendering_obj = original_results["render_object"]
+        ori_logits = classifier(original_rendering_obj)
+        ori_pred_obj = torch.argmax(ori_logits, dim=0)
+        gt_object_others = ori_pred_obj.squeeze(0)
+    else:
+        gt_object_others = view.objects.squeeze(0)
+
+    mask_fg = object_id_mask(gt_object_others, select_obj_id)
+    if torch.is_tensor(mask_fg):
+        mask_fg = mask_fg.detach().cpu().numpy()
+    mask_fg = torch.Tensor(convex_hull_image(mask_fg)).cuda()
+    mask_others = 1 - mask_fg
+
+    source_mask = mask_others.cuda() * 255.0
+    point = get_init_points(
+        view,
+        image=(view.original_image.to(mask_others.device)) * ((mask_others).unsqueeze(0).repeat(3, 1, 1)),
+        mask=source_mask,
+    )
+    depth_remove = view.depths[:, :, 1].clone()
+    depth_point = get_init_points(
+        view,
+        image=(depth_remove.unsqueeze(0).repeat(3, 1, 1).to(mask_others.device)),
+        mask=source_mask,
+    )
+
+    return {
+        "point": point.detach().cpu(),
+        "depth_point": depth_point.detach().cpu(),
+    }
+
+
+def get_intersect_source_entry(source_cache, cache_size, idx, view, select_obj_id, original_gaussians, is_pbr, pipeline, background, opt, pbr_kwargs, classifier):
+    if source_cache is not None and idx in source_cache:
+        source_cache.move_to_end(idx)
+        return source_cache[idx]
+
+    entry = build_intersect_source_entry(
+        view,
+        select_obj_id,
+        original_gaussians,
+        is_pbr,
+        pipeline,
+        background,
+        opt,
+        pbr_kwargs,
+        classifier,
+    )
+    if source_cache is not None:
+        source_cache[idx] = entry
+        source_cache.move_to_end(idx)
+        while cache_size > 0 and len(source_cache) > cache_size:
+            source_cache.popitem(last=False)
+    return entry
+
+
+def object_mask_area(labels, object_ids):
+    mask = object_id_mask(labels, object_ids)
+    if torch.is_tensor(mask):
+        return int(mask.sum().item())
+    return int(mask.sum())
+
+
+def select_intersect_candidate_indices(views, select_obj_id, top_m):
+    if top_m <= 0:
+        return None
+
+    areas = []
+    for idx, view in enumerate(views):
+        if view.objects is None:
+            return None
+        area = object_mask_area(view.objects.squeeze(0), select_obj_id)
+        if area > 0:
+            areas.append((area, idx))
+
+    areas.sort(key=lambda item: (-item[0], item[1]))
+    selected = {idx for _, idx in areas[:top_m]}
+    return selected, len(areas)
+
+
+def find_intersect_mask(mask_input, viewpoint_cam, views, select_obj_id, id_now, original_gaussians, is_pbr, pipeline, background, opt, pbr_kwargs, classifier, source_cache=None, intersect_cache_size=DEFAULT_INTERSECT_CACHE_SIZE):
     all_mask_stack=[]
     mask_now = mask_input.numpy()
     mask_now = torch.Tensor(convex_hull_image(mask_now)).cuda()
@@ -306,11 +421,6 @@ def find_intersect_mask(mask_input, viewpoint_cam, views, select_obj_id, id_now,
     gt_shape = mask_now.shape
     gt_image_now = viewpoint_cam.original_image.cuda() * (1-(mask_input.cuda().unsqueeze(0).repeat(3,1,1))/255.0)
     depth_remove_now = viewpoint_cam.depths[:,:,1]
-    # print(depth_remove_now.max(), depth_remove_now.min())
-    if is_pbr:
-        render = render_fn_dict["neilf"]
-    else:
-        render = render_fn_dict["render"]
     # print(mask_now.nonzero())
     
     # mask_last = mask_now
@@ -319,64 +429,56 @@ def find_intersect_mask(mask_input, viewpoint_cam, views, select_obj_id, id_now,
     id_list = torch.multinomial(torch.ones(len(views)).float(), 30)
     # print(id_list)
     # exit()
+
+    R,T,FovY,FovX, width, height = viewpoint_cam.R, viewpoint_cam.T, viewpoint_cam.FoVy, viewpoint_cam.FoVx, viewpoint_cam.image_width, viewpoint_cam.image_height
+    f_x = fov2focal(FovX, width)
+    f_y = fov2focal(FovY, height)
+    c_y = height/2.0
+    c_x = width/2.0
+    A = torch.Tensor([[f_x, 0, c_x],
+                    [0, f_y, c_y],
+                    [0,0,1.0]]).to(mask_now.device)
+    wtc_project = viewpoint_cam.world_view_transform.T
+    target_w2c = torch.Tensor(wtc_project).to(mask_now.device)
     
-    for idx, view in enumerate(tqdm(views.copy(), desc="intersect mask")):
+    for idx, view in enumerate(views):
         if ((idx < int(id_now+100)) and (idx> (int(id_now)-100))):
         # if idx in id_list:
-            if view.objects is None:
-                if is_pbr:
-                    original_results =  render(view, original_gaussians, pipeline, background, opt=opt, is_training=False, dict_params=pbr_kwargs)
-                else:
-                    original_results =  render(view, original_gaussians, pipeline, background)
-                original_rendering_obj = original_results["render_object"]
-                ori_logits = classifier(original_rendering_obj)
-                ori_pred_obj = torch.argmax(ori_logits,dim=0)
-                gt_object_others = ori_pred_obj.squeeze(0)
-            else:
-                gt_object_others = view.objects.squeeze(0)
-            # mask_others = (((gt_object_others * (gt_object_others == select_obj_id[0])) > 0).int()*255.0).cuda()
-            mask_fg = (((gt_object_others * (gt_object_others == select_obj_id[0])) > 0).int()).numpy()
-            # print(mask_fg.shape)
-            mask_fg = torch.Tensor(convex_hull_image(mask_fg)).cuda()
-
-            mask_others = 1 - mask_fg
-            # view.objects = mask_others.cuda()*255.0
-            # print(view.original_image.shape, mask_others.shape)
-
-            # view.original_image = (view.original_image.to(mask_others.device)) * ((mask_others).unsqueeze(0).repeat(3,1,1))
-            # view.depths = torch.ones_like(view.original_image).cuda()
-            point = get_init_points(view, image=(view.original_image.to(mask_others.device)) * ((mask_others).unsqueeze(0).repeat(3,1,1)), mask=mask_others.cuda()*255.0)
+            source_entry = get_intersect_source_entry(
+                source_cache,
+                intersect_cache_size,
+                idx,
+                view,
+                select_obj_id,
+                original_gaussians,
+                is_pbr,
+                pipeline,
+                background,
+                opt,
+                pbr_kwargs,
+                classifier,
+            )
+            point = source_entry["point"].to(mask_now.device, non_blocking=True)
 
             # input()
 
-            depth_remove = view.depths[:,:,1].clone()
-
-            depth_point = get_init_points(view, image=(depth_remove.unsqueeze(0).repeat(3,1,1).to(mask_others.device)), mask=mask_others.cuda()*255.0)
+            depth_point = source_entry["depth_point"].to(mask_now.device, non_blocking=True)
             # print(point.shape)
             # print(depth_point.min(), depth_point.max())
 
-            R,T,FovY,FovX, width, height = viewpoint_cam.R, viewpoint_cam.T, viewpoint_cam.FoVy, viewpoint_cam.FoVx, viewpoint_cam.image_width, viewpoint_cam.image_height
-            f_x = fov2focal(FovX, width)
-            f_y = fov2focal(FovY, height)
             # print(f_x, f_y)
             # camera_center = viewpoint_cam.camera_center
             # print(camera_center)
             # print(T)
-            c_y = height/2.0
-            c_x = width/2.0
             P = np.zeros((4, 4))
             P[0:3,0:3] = R
             P[3,0:3] = T
             P[3,3] = 1
-            A = torch.Tensor([[f_x, 0, c_x],
-                            [0, f_y, c_y],
-                            [0,0,1.0]]).to(point.device)
             # print(mask_index[0].shape)
             extrinsic = viewpoint_cam.camera_back_project
-            wtc_project = viewpoint_cam.world_view_transform.T
-            target_point_ref = world_to_new_view(point, A, torch.Tensor(wtc_project).to(point.device))
+            target_point_ref = world_to_new_view(point, A, target_w2c)
 
-            target_depth_ref = world_to_new_view(depth_point, A, torch.Tensor(wtc_project).to(point.device))
+            target_depth_ref = world_to_new_view(depth_point, A, target_w2c)
 
             
 
@@ -450,6 +552,8 @@ def find_intersect_mask(mask_input, viewpoint_cam, views, select_obj_id, id_now,
             # print()
             swap_index = depth_mask.nonzero(as_tuple=True)
             mask_now[(swap_index[0], swap_index[1])] = torch.zeros(len(swap_index[1])).to(mask_now.device)
+            if not torch.any(mask_now > 0):
+                break
             # # input()
             # print(gt_image_now.shape, mask_now.shape)
             # input()
@@ -491,7 +595,11 @@ def find_intersect_mask(mask_input, viewpoint_cam, views, select_obj_id, id_now,
 
 
 
-def render_set(is_pbr, pbr_kwargs, model_path, name, iteration, views, gaussians, pipeline, background, classifier, select_obj_id=0, render_intersect=False):
+def render_set(is_pbr, pbr_kwargs, model_path, name, iteration, views, gaussians, pipeline, background, classifier, select_obj_id=0, render_intersect=False, intersect_cache_size=DEFAULT_INTERSECT_CACHE_SIZE, intersect_top_m=DEFAULT_INTERSECT_TOP_M):
+    if intersect_cache_size < 0:
+        raise ValueError(f"intersect_cache_size must be >= 0, got {intersect_cache_size}")
+    if intersect_top_m < 0:
+        raise ValueError(f"intersect_top_m must be >= 0, got {intersect_top_m}")
     if is_pbr:
         render = render_fn_dict["neilf"]
     else:
@@ -531,12 +639,28 @@ def render_set(is_pbr, pbr_kwargs, model_path, name, iteration, views, gaussians
     gaussians, removed_gaussian, original_gaussians = gaussians
     # print(len(views))
     # input()
+    intersect_source_cache = OrderedDict() if render_intersect and intersect_cache_size > 0 else None
+    intersect_candidate_indices = None
+    render_indices = list(range(len(views)))
+    if render_intersect:
+        print(f"Intersect source cache size: {intersect_cache_size}")
+        selected = select_intersect_candidate_indices(views, select_obj_id, intersect_top_m)
+        if selected is None:
+            print("Intersect candidate prefilter disabled; computing intersect masks for all views.")
+        else:
+            intersect_candidate_indices, positive_count = selected
+            render_indices = sorted(intersect_candidate_indices)
+            print(
+                "Intersect candidate prefilter: "
+                f"top_m={intersect_top_m}, selected={len(intersect_candidate_indices)}, positive_views={positive_count}"
+            )
 
     with torch.no_grad():
 
         ordered_stems = []
         view_order = []
-        for view_idx, view in enumerate(tqdm(views, desc="Rendering progress")):
+        for view_idx in tqdm(render_indices, desc="Rendering progress"):
+            view = views[view_idx]
             # print(is_pbr)
             if is_pbr:
                 results = render(view, gaussians, pipeline, background, opt=opt, is_training=False, dict_params=pbr_kwargs)
@@ -599,14 +723,31 @@ def render_set(is_pbr, pbr_kwargs, model_path, name, iteration, views, gaussians
                 gt_objects = ori_pred_obj.squeeze(0)
             else:
                 gt_objects = view.objects.squeeze(0)
-            remove_obj = ((gt_objects * (gt_objects == select_obj_id[0])) > 0).int().cpu()*255.0
+            remove_obj = object_id_mask(gt_objects, select_obj_id).int().cpu()*255.0
             # remain_obj = (gt_objects * (~(gt_objects == select_obj_id[0]))).cpu().int().numpy().astype(np.uint8)
             remain_obj = (gt_objects).cpu().int().numpy().astype(np.uint8)
             gt_rgb_mask = visualize_obj(gt_objects.cpu().numpy().astype(np.uint8))
             gt_objects = gt_objects.cpu().int().numpy().astype(np.uint8)
 
-            if render_intersect:
-                intersect_mask = find_intersect_mask(remove_obj.clone(), copy.deepcopy(view), views.copy(), select_obj_id, id_now = view_idx, original_gaussians = original_gaussians, is_pbr = is_pbr, pipeline=pipeline, background=background, opt=opt, pbr_kwargs=pbr_kwargs, classifier=classifier)
+            if render_intersect and (intersect_candidate_indices is None or view_idx in intersect_candidate_indices):
+                intersect_mask = find_intersect_mask(
+                    remove_obj.clone(),
+                    view,
+                    views,
+                    select_obj_id,
+                    id_now=view_idx,
+                    original_gaussians=original_gaussians,
+                    is_pbr=is_pbr,
+                    pipeline=pipeline,
+                    background=background,
+                    opt=opt,
+                    pbr_kwargs=pbr_kwargs,
+                    classifier=classifier,
+                    source_cache=intersect_source_cache,
+                    intersect_cache_size=intersect_cache_size,
+                )
+            elif render_intersect:
+                intersect_mask = remove_obj.numpy().astype(np.uint8)
 
             # print(rendered_depth.shape)
             # print(depth_real.max(), depth_real.min())
@@ -655,6 +796,18 @@ def render_set(is_pbr, pbr_kwargs, model_path, name, iteration, views, gaussians
 
     with open(os.path.join(output_root, "view_order.json"), "w") as file:
         json.dump(view_order, file, indent=2)
+    if render_intersect and intersect_candidate_indices is not None:
+        candidate_entries = [
+            entry for entry in view_order
+            if int(entry["index"]) - 1 in intersect_candidate_indices
+        ]
+        with open(os.path.join(output_root, "intersect_candidates.json"), "w") as file:
+            json.dump({
+                "mode": "top_m",
+                "top_m": int(intersect_top_m),
+                "stems": [entry["stem"] for entry in candidate_entries],
+                "entries": candidate_entries,
+            }, file, indent=2)
 
     out_path = os.path.join(render_path[:-8],'concat')
     makedirs(out_path,exist_ok=True)
@@ -680,7 +833,7 @@ def render_set(is_pbr, pbr_kwargs, model_path, name, iteration, views, gaussians
     writer.release()
 
 
-def removal(is_pbr, dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, opt : OptimizationParams, select_obj_id : int, removal_thresh : float, render_intersect: bool):
+def removal(is_pbr, dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, opt : OptimizationParams, select_obj_id : int, removal_thresh : float, render_intersect: bool, intersect_cache_size: int, intersect_top_m: int):
     # 1. load gaussian checkpoint
 
     if is_pbr:
@@ -762,10 +915,10 @@ def removal(is_pbr, dataset : ModelParams, iteration : int, pipeline : PipelineP
     scene = Scene(dataset, gaussians, load_iteration='_object_removal/iteration_'+str(load_iter), shuffle=False)
     with torch.no_grad():
         if not skip_train:
-             render_set(is_pbr, pbr_kwargs,dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), [gaussians, removed_gaussian, original_gaussians], pipeline, background, classifier, select_obj_id, render_intersect)
+             render_set(is_pbr, pbr_kwargs,dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), [gaussians, removed_gaussian, original_gaussians], pipeline, background, classifier, select_obj_id, render_intersect, intersect_cache_size, intersect_top_m)
 
         if not skip_test and len(scene.getTestCameras()) != 0:
-             render_set(is_pbr, pbr_kwargs,dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), [gaussians, removed_gaussian, original_gaussians], pipeline, background, classifier, select_obj_id, render_intersect)
+             render_set(is_pbr, pbr_kwargs,dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), [gaussians, removed_gaussian, original_gaussians], pipeline, background, classifier, select_obj_id, render_intersect, intersect_cache_size, intersect_top_m)
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -778,6 +931,8 @@ if __name__ == "__main__":
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--render_intersect", action="store_true")
+    parser.add_argument("--intersect_cache_size", type=int, default=DEFAULT_INTERSECT_CACHE_SIZE, help="LRU cache size for source-view intersect back-projection entries. Use 0 to disable.")
+    parser.add_argument("--intersect_top_m", type=int, default=DEFAULT_INTERSECT_TOP_M, help="Only compute exact intersect masks for the top-M ordinary removal-mask views. Use 0 to compute all views.")
     parser.add_argument('-t', '--type', choices=['render', 'normal', 'neilf'], default='render')
 
     parser.add_argument("--config_file", type=str, default="configs/object_removal/bear.json", help="Path to the configuration file")
@@ -807,6 +962,8 @@ if __name__ == "__main__":
     args.images = config.get("images", "images")
     args.object_path = config.get("object_path", "object_mask")
     args.source_path = config.get("source_path", "./data/bear")
+    args.intersect_cache_size = int(config.get("intersect_cache_size", args.intersect_cache_size))
+    args.intersect_top_m = int(config.get("intersect_top_m", args.intersect_top_m))
     # args.checkpoint = config.get("checkpoint", None)
 
     # Initialize system state (RNG)
@@ -815,4 +972,4 @@ if __name__ == "__main__":
     is_pbr = args.type == "neilf"
     # print(args.type)
     # input()
-    removal(is_pbr, model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, opt.extract(args), args.select_obj_id, args.removal_thresh, args.render_intersect)
+    removal(is_pbr, model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, opt.extract(args), args.select_obj_id, args.removal_thresh, args.render_intersect, args.intersect_cache_size, args.intersect_top_m)

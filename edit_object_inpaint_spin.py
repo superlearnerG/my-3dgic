@@ -33,7 +33,7 @@ import colorsys
 from scene.gamma_trans import LearningGammaTransform
 from scene.derect_light_sh import DirectLightEnv
 
-from edit_object_removal import points_inside_convex_hull
+from edit_object_removal import object_id_mask, points_inside_convex_hull
 from utils.ggutils import visualize_obj, feature_to_rgb
 
 
@@ -237,6 +237,8 @@ def get_init_points(cam, default_depth=False, custom_mask = None):
     if custom_mask is not None:
         mask2d = custom_mask
     else:    
+        if cam.objects is None:
+            raise ValueError(f"No inpaint mask found for reference view {cam.image_name}")
         mask2d = (cam.objects >128).to(depth.device).squeeze()
 
     # mask2d = gt_mask
@@ -338,10 +340,9 @@ def finetune_inpaint(is_pbr, pbr_kwargs, dataset, pipe, opt, model_path, iterati
     for cam in ref_cameras:
         depth = (cam.depths).float().permute(2,0,1)
         gt_obj = depth[-1].long().cuda()
-        gt_mask = (gt_obj == selected_obj_ids[0])
+        gt_mask = object_id_mask(gt_obj, selected_obj_ids)
         ref_view_name.append(cam.image_name)
-        # point, _ = get_init_points(cam, custom_mask=gt_mask)
-        point, _ = get_init_points(cam)
+        point, _ = get_init_points(cam, custom_mask=gt_mask)
         points.append(point)
 
 
@@ -476,8 +477,11 @@ def finetune_inpaint(is_pbr, pbr_kwargs, dataset, pipe, opt, model_path, iterati
         depth = (viewpoint_cam.depths).float().permute(2,0,1)
         cam_name = viewpoint_cam.image_name
         gt_obj = depth[-1].long().cuda()
-        gt_mask = (gt_obj == selected_obj_ids[0])
-        mask2d = (viewpoint_cam.objects > 128).squeeze().cuda()
+        gt_mask = object_id_mask(gt_obj, selected_obj_ids)
+        if viewpoint_cam.objects is None:
+            mask2d = gt_mask if depth.shape[0] > 3 else torch.zeros_like(gt_mask)
+        else:
+            mask2d = (viewpoint_cam.objects > 128).squeeze().cuda()
         if torch.equal(mask2d.long(), torch.zeros_like(mask2d)):
             if depth.shape[0] > 3:
                 
@@ -642,7 +646,7 @@ def finetune_inpaint(is_pbr, pbr_kwargs, dataset, pipe, opt, model_path, iterati
                 # print(logits.shape)
                 # print(cls_criterion(logits.unsqueeze(0), gt_obj.unsqueeze(0)).shape)
                 # input()
-                loss_obj = (cls_criterion(logits.unsqueeze(0), gt_obj.unsqueeze(0)).squeeze()*(~(gt_obj == selected_obj_ids[0]))).mean()
+                loss_obj = (cls_criterion(logits.unsqueeze(0), gt_obj.unsqueeze(0)).squeeze()*(~object_id_mask(gt_obj, selected_obj_ids))).mean()
                 loss_obj = loss_obj / torch.log(torch.tensor(logits.shape[0]))
 
                 ### reg_loss_3d
@@ -724,7 +728,10 @@ def finetune_inpaint(is_pbr, pbr_kwargs, dataset, pipe, opt, model_path, iterati
 
             
             # Object Loss
-            gt_obj = viewpoint_cam.objects.cuda().long()
+            if viewpoint_cam.objects is None:
+                gt_obj = depth[-1].long().cuda() if depth.shape[0] > 3 else torch.zeros_like(depth[0]).long().cuda()
+            else:
+                gt_obj = viewpoint_cam.objects.cuda().long()
             if depth.shape[0] > 3:
                 gt_obj = depth[-1].long().cuda()
             
@@ -1047,6 +1054,9 @@ if __name__ == "__main__":
     args.finetune_iteration = config.get("finetune_iteration", 10_000)
     args.source_path = config.get("source_path", "./data/bear")
     args.exp_setting = config.get("exp_setting", "depth_init")
+    if args.skip_test and args.images == "substitude":
+        print("Substitude inputs are train-only for iterative inpaint; disabling eval split for this stage.")
+        args.eval = False
     # print(config.get("skip_init", "False"))
     # input()
     args.skip_init = config.get("skip_init", "False")

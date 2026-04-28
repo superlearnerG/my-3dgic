@@ -1,0 +1,22 @@
+{
+  "defaults": {
+    "top_k_ref_views": 3,
+    "simple_lama_device": "cuda",
+    "mask_threshold": 0,
+    "mask_dilation": 0,
+    "intersect_top_m": 20,
+    "intersect_cache_size": 256,
+    "background_id": 0,
+    "finetune_iteration": 10000
+  },
+  "removal_config_template": "../object_removal/bear.json",
+  "inpaint_config_template": "../object_inpaint/bear_new.json",
+  "rounds": [
+    { "target_id": [30, 83, 72, 51] },
+    { "target_id": [40, 62, 105, 94] },
+    { "target_id": [115, 158, 222, 233] },
+    { "target_id": [169, 180, 126, 142] },
+    { "target_id": [201, 212, 244] },
+    { "target_id": [190] }
+  ]
+}
