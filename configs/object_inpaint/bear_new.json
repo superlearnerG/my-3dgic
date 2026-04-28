@@ -7,7 +7,7 @@
     "depth_path" : "depth_removal",
     "r" : 1,
     "lambda_dlpips" : 0.5,
-    "finetune_iteration": 10000,
+    "finetune_iteration": 5000,
     "exp_setting": "3dgic",
     "source_path": "./data/bear",
     "reg3d_interval": 5,

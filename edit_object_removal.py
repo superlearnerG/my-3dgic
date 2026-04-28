@@ -19,17 +19,12 @@ from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, OptimizationParams, get_combined_args
 import numpy as np
 from PIL import Image
-import colorsys
 import json
 from collections import OrderedDict
-
-import cv2
-from sklearn.decomposition import PCA
 
 from scipy.spatial import ConvexHull, Delaunay
 from scipy import ndimage
 from skimage.morphology import convex_hull_image
-from utils.ggutils import visualize_obj, feature_to_rgb
 import copy
 
 from scene.gamma_trans import LearningGammaTransform
@@ -606,37 +601,23 @@ def render_set(is_pbr, pbr_kwargs, model_path, name, iteration, views, gaussians
         render = render_fn_dict["render"]
     output_root = os.path.join(model_path, name, "ours{}".format(iteration))
     render_path = os.path.join(model_path, name, "ours{}".format(iteration), "renders")
-    ori_render_path = os.path.join(model_path, name, "ours{}".format(iteration), "ori_renders")
     depth_path = os.path.join(model_path, name, "ours{}".format(iteration), "depth")
     depth_real_path = os.path.join(model_path, name, "ours{}".format(iteration), "depth_removal")
-    gts_path = os.path.join(model_path, name, "ours{}".format(iteration), "gt")
-    colormask_path = os.path.join(model_path, name, "ours{}".format(iteration), "objects_feature16")
-    gt_colormask_path = os.path.join(model_path, name, "ours{}".format(iteration), "gt_objects_color")
     gt_mask_path = os.path.join(model_path, name, "ours{}".format(iteration), "gt_objects")
-    pred_obj_path = os.path.join(model_path, name, "ours{}".format(iteration), "objects_pred")
     remove_obj_path = os.path.join(model_path, name, "ours{}".format(iteration), "remove_objects_pred")
-    remain_obj_path = os.path.join(model_path, name, "ours{}".format(iteration), "remain_objects_pred")
     inpaint_mask_path = os.path.join(model_path, name, "ours{}".format(iteration), "inpaint_mask_pred")
-    removed_base_color_path = os.path.join(model_path, name, "ours{}".format(iteration), "base_color")
-    pbr_path = os.path.join(model_path, name, "ours{}".format(iteration), "pbr")
-    # opacity_path = os.path.join(model_path, name, "ours{}".format(iteration), "opacity")
-    makedirs(render_path, exist_ok=True)
-    makedirs(ori_render_path, exist_ok=True)
-    makedirs(gts_path, exist_ok=True)
-    makedirs(colormask_path, exist_ok=True)
-    makedirs(gt_colormask_path, exist_ok=True)
-    makedirs(gt_mask_path, exist_ok=True)
-    makedirs(pred_obj_path, exist_ok=True)
-    makedirs(depth_path, exist_ok=True)
-    makedirs(depth_real_path, exist_ok=True)
-    makedirs(remove_obj_path, exist_ok=True)
-    makedirs(remain_obj_path, exist_ok=True)
-    makedirs(inpaint_mask_path, exist_ok=True)
-    makedirs(removed_base_color_path, exist_ok=True)
-    makedirs(pbr_path, exist_ok=True)
-    gt_shape = -1
+    save_base_outputs = not render_intersect
+    makedirs(output_root, exist_ok=True)
+    if save_base_outputs:
+        makedirs(render_path, exist_ok=True)
+        makedirs(depth_path, exist_ok=True)
+        makedirs(depth_real_path, exist_ok=True)
+        makedirs(gt_mask_path, exist_ok=True)
+        makedirs(remove_obj_path, exist_ok=True)
+    if render_intersect:
+        makedirs(inpaint_mask_path, exist_ok=True)
 
-    gaussians, removed_gaussian, original_gaussians = gaussians
+    gaussians, _removed_gaussian, original_gaussians = gaussians
     # print(len(views))
     # input()
     intersect_source_cache = OrderedDict() if render_intersect and intersect_cache_size > 0 else None
@@ -657,33 +638,21 @@ def render_set(is_pbr, pbr_kwargs, model_path, name, iteration, views, gaussians
 
     with torch.no_grad():
 
-        ordered_stems = []
         view_order = []
         for view_idx in tqdm(render_indices, desc="Rendering progress"):
             view = views[view_idx]
             # print(is_pbr)
             if is_pbr:
                 results = render(view, gaussians, pipeline, background, opt=opt, is_training=False, dict_params=pbr_kwargs)
-                removed_results = render(view, removed_gaussian, pipeline, background, opt=opt, is_training=False, dict_params=pbr_kwargs)
-                original_results =  render(view, original_gaussians, pipeline, background, opt=opt, is_training=False, dict_params=pbr_kwargs)
             else:
                 results = render(view, gaussians, pipeline, background)
-            # results = render(view, gaussians, pipeline, background)
-                removed_results = render(view, removed_gaussian, pipeline, background)
-                original_results =  render(view, original_gaussians, pipeline, background)
 
             rendering = results["render"]
-            rendering_obj = results["render_object"]
-
-            original_rendering = original_results["render"]
-            if is_pbr:
-                base_color = results["base_color"]
-                pbr = results["pbr"]
+            depth_real = results["depth"]
 
             # print(results["name"])
             image_name = results["name"]
             stem = _output_stem(image_name, view_idx)
-            ordered_stems.append(stem)
             view_order.append({
                 "index": view_idx + 1,
                 "image_name": str(image_name),
@@ -692,41 +661,24 @@ def render_set(is_pbr, pbr_kwargs, model_path, name, iteration, views, gaussians
                 "files": {
                     "render": os.path.join("renders", stem + ".png"),
                     "inpaint_mask": os.path.join("inpaint_mask_pred", stem + ".png"),
-                    "depth": os.path.join("depth", stem + ".png"),
                     "depth_removal": os.path.join("depth_removal", stem + ".png"),
                     "gt_objects": os.path.join("gt_objects", stem + ".png"),
                 },
             })
 
-
-            removed_rendering_obj = removed_results["render_object"]
-            original_rendering_obj = original_results["render_object"]
-
-            depth_real = results["depth"]
-            original_depth = original_results["depth"]
-
-            logits = classifier(rendering_obj)
-            pred_obj = torch.argmax(logits,dim=0)
-            pred_obj_mask = visualize_obj(pred_obj.cpu().numpy().astype(np.uint8))
-
-            ori_logits = classifier(original_rendering_obj)
-            ori_pred_obj = torch.argmax(ori_logits,dim=0)
-            ori_pred_obj_mask = visualize_obj(ori_pred_obj.cpu())
-            
-
-            logits = classifier(removed_rendering_obj.cuda())
-            pred_obj = torch.argmax(logits,dim=0).cpu()
-            # pred_obj_mask = visualize_obj(pred_obj.cpu().numpy().astype(np.uint8))
-
+            original_results = None
             if view.objects is None:
-                # view.objects = ori_pred_obj
+                if is_pbr:
+                    original_results = render(view, original_gaussians, pipeline, background, opt=opt, is_training=False, dict_params=pbr_kwargs)
+                else:
+                    original_results = render(view, original_gaussians, pipeline, background)
+                original_rendering_obj = original_results["render_object"]
+                ori_logits = classifier(original_rendering_obj)
+                ori_pred_obj = torch.argmax(ori_logits,dim=0)
                 gt_objects = ori_pred_obj.squeeze(0)
             else:
                 gt_objects = view.objects.squeeze(0)
             remove_obj = object_id_mask(gt_objects, select_obj_id).int().cpu()*255.0
-            # remain_obj = (gt_objects * (~(gt_objects == select_obj_id[0]))).cpu().int().numpy().astype(np.uint8)
-            remain_obj = (gt_objects).cpu().int().numpy().astype(np.uint8)
-            gt_rgb_mask = visualize_obj(gt_objects.cpu().numpy().astype(np.uint8))
             gt_objects = gt_objects.cpu().int().numpy().astype(np.uint8)
 
             if render_intersect and (intersect_candidate_indices is None or view_idx in intersect_candidate_indices):
@@ -753,46 +705,25 @@ def render_set(is_pbr, pbr_kwargs, model_path, name, iteration, views, gaussians
             # print(depth_real.max(), depth_real.min())
             # input()
 
-            rgb_mask = feature_to_rgb(rendering_obj)
             if render_intersect:
                 Image.fromarray(intersect_mask).save(os.path.join(inpaint_mask_path, stem + ".png"))
-            torch.save(original_depth,os.path.join(depth_path, stem + "_original.pt"))
-            torch.save(depth_real,os.path.join(depth_path, stem + "_remove.pt"))
-            Image.fromarray(rgb_mask).save(os.path.join(colormask_path, stem + ".png"))
-            Image.fromarray(gt_rgb_mask).save(os.path.join(gt_colormask_path, stem + ".png"))
-            Image.fromarray(gt_objects).save(os.path.join(gt_mask_path, stem + ".png"))
-            Image.fromarray(pred_obj_mask).save(os.path.join(pred_obj_path, stem + ".png"))
-            # Image.fromarray(pred_obj_mask).save(os.path.join(pred_obj_path, '{0:05d}'.format(idx) + ".png"))
-            Image.fromarray(remain_obj).save(os.path.join(remain_obj_path, stem + ".png"))
-            gt = view.original_image[0:3, :, :]
-            gt_shape = gt.shape
+            if save_base_outputs:
+                if original_results is None:
+                    if is_pbr:
+                        original_results = render(view, original_gaussians, pipeline, background, opt=opt, is_training=False, dict_params=pbr_kwargs)
+                    else:
+                        original_results = render(view, original_gaussians, pipeline, background)
+                original_depth = original_results["depth"]
+                torch.save(original_depth,os.path.join(depth_path, stem + "_original.pt"))
+                torch.save(depth_real,os.path.join(depth_path, stem + "_remove.pt"))
+                Image.fromarray(gt_objects).save(os.path.join(gt_mask_path, stem + ".png"))
+                torchvision.utils.save_image(remove_obj, os.path.join(remove_obj_path, stem + ".png"))
+                torchvision.utils.save_image(rendering, os.path.join(render_path, stem + ".png"))
 
-            torchvision.utils.save_image(gt, os.path.join(gts_path, stem + ".png"))
-            torchvision.utils.save_image(remove_obj, os.path.join(remove_obj_path, stem + ".png"))
-            torchvision.utils.save_image(rendering, os.path.join(render_path, stem + ".png"))
-            torchvision.utils.save_image(original_rendering, os.path.join(ori_render_path, stem + ".png"))
-            if is_pbr:
-                torchvision.utils.save_image(base_color, os.path.join(removed_base_color_path, stem + ".png"))
-                torchvision.utils.save_image(pbr, os.path.join(pbr_path, stem + ".png"))
-            
-
-            d_min, d_max = depth_real.min(), depth_real.min()+5
-            # d_min, d_max = depth_real.min(), depth_real.max()
-
-            # print(d_min, d_max)
-            # input()
-            depth_real = (depth_real.float().clamp(0,d_max) - d_min)/(d_max-d_min)
-            torchvision.utils.save_image(depth_real, os.path.join(depth_real_path, stem + ".png"))
-            torch.save((d_min,d_max),os.path.join(depth_real_path, stem + "_range.pt"))
-
-            # d_min_ori, d_max_ori = original_depth.min(), original_depth.min()+5
-            d_min_ori, d_max_ori = original_depth.min(), original_depth.max()
-
-            # print(d_min, d_max)
-            # input()
-            original_depth = (original_depth.float().clamp(0,d_max_ori) - d_min_ori)/(d_max_ori-d_min_ori)
-            torchvision.utils.save_image(original_depth, os.path.join(depth_path, stem + ".png"))
-            torch.save((d_min_ori,d_max_ori),os.path.join(depth_path, stem + "_range.pt"))
+                d_min, d_max = depth_real.min(), depth_real.min()+5
+                normalized_depth = (depth_real.float().clamp(0,d_max) - d_min)/(d_max-d_min)
+                torchvision.utils.save_image(normalized_depth, os.path.join(depth_real_path, stem + ".png"))
+                torch.save((d_min,d_max),os.path.join(depth_real_path, stem + "_range.pt"))
 
     with open(os.path.join(output_root, "view_order.json"), "w") as file:
         json.dump(view_order, file, indent=2)
@@ -808,30 +739,6 @@ def render_set(is_pbr, pbr_kwargs, model_path, name, iteration, views, gaussians
                 "stems": [entry["stem"] for entry in candidate_entries],
                 "entries": candidate_entries,
             }, file, indent=2)
-
-    out_path = os.path.join(render_path[:-8],'concat')
-    makedirs(out_path,exist_ok=True)
-    fourcc = cv2.VideoWriter.fourcc(*'mp4v') 
-    size = (gt_shape[-1]*5,gt_shape[-2])
-    fps = float(5) if 'train' in out_path else float(1)
-    writer = cv2.VideoWriter(os.path.join(out_path,'result.mp4'), fourcc, fps, size)
-
-    for stem in ordered_stems:
-        file_name = stem + ".png"
-        gt = np.array(Image.open(os.path.join(gts_path,file_name)))
-        rgb = np.array(Image.open(os.path.join(render_path,file_name)))
-        gt_obj = np.array(Image.open(os.path.join(gt_colormask_path,file_name)))
-        render_obj = np.array(Image.open(os.path.join(colormask_path,file_name)))
-        pred_obj = np.array(Image.open(os.path.join(pred_obj_path,file_name)))
-
-        result = np.hstack([gt,rgb,gt_obj,pred_obj,render_obj])
-        result = result.astype('uint8')
-
-        Image.fromarray(result).save(os.path.join(out_path,file_name))
-        writer.write(result[:,:,::-1])
-
-    writer.release()
-
 
 def removal(is_pbr, dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, opt : OptimizationParams, select_obj_id : int, removal_thresh : float, render_intersect: bool, intersect_cache_size: int, intersect_top_m: int):
     # 1. load gaussian checkpoint
