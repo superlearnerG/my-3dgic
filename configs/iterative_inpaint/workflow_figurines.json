@@ -12,11 +12,7 @@
   "removal_config_template": "../object_removal/bear.json",
   "inpaint_config_template": "../object_inpaint/bear_new.json",
   "rounds": [
-    { "target_id": [30, 83, 72, 51] },
-    { "target_id": [40, 62, 105, 94] },
-    { "target_id": [115, 158, 222, 233] },
-    { "target_id": [169, 180, 126, 142] },
-    { "target_id": [201, 212, 244] },
-    { "target_id": [190] }
+    { "target_id": [30, 83, 72, 51, 40, 62, 105, 94, 115, 158] },
+    { "target_id": [222, 233, 169, 180, 126, 142, 201, 212, 244, 190] }
   ]
 }

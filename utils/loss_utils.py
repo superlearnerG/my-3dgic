@@ -121,13 +121,13 @@ def loss_cls_3d(features, predictions, k=5, lambda_val=2.0, max_points=200000, s
     """
     # Conditionally downsample if points exceed max_points
     if features.size(0) > max_points:
-        indices = torch.randperm(features.size(0))[:max_points]
+        indices = torch.randperm(features.size(0), device=features.device)[:max_points]
         features = features[indices]
         predictions = predictions[indices]
 
 
     # Randomly sample points for which we'll compute the loss
-    indices = torch.randperm(features.size(0))[:sample_size]
+    indices = torch.randperm(features.size(0), device=features.device)[:sample_size]
     sample_features = features[indices]
     sample_preds = predictions[indices]
 
@@ -147,4 +147,3 @@ def loss_cls_3d(features, predictions, k=5, lambda_val=2.0, max_points=200000, s
     normalized_loss = loss / num_classes
 
     return lambda_val * normalized_loss
-

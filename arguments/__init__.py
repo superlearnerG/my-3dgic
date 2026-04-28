@@ -133,6 +133,10 @@ class OptimizationParams(ParamGroup):
         self.reg3d_lambda_val = 2
         self.reg3d_max_points = 300000
         self.reg3d_sample_size = 1000
+        self.max_inpaint_init_points = 100000
+        self.object_loss_max_pixels = 65536
+        self.lpips_max_size = 384
+        self.debug_dump_init_points = False
 
         super().__init__(parser, "Optimization Parameters")
 

@@ -211,7 +211,115 @@ def divide_into_patches(image, K):
     patches = patches.view(B, C, patch_h, patch_w, -1)
     return patches.permute(0, 4, 1, 2, 3)
 
-def get_init_points(cam, default_depth=False, custom_mask = None):
+
+def _as_bool(value):
+    if isinstance(value, str):
+        return value.lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def limit_points(points, max_points, label):
+    max_points = int(max_points or 0)
+    if max_points <= 0 or points.size(0) <= max_points:
+        return points
+    indices = torch.randperm(points.size(0), device=points.device)[:max_points]
+    print(f"{label}: sampled {max_points}/{points.size(0)} points for memory control")
+    return points[indices]
+
+
+def resize_long_side(image, max_size):
+    max_size = int(max_size or 0)
+    if max_size <= 0:
+        return image
+    _, height, width = image.shape
+    long_side = max(height, width)
+    if long_side <= max_size:
+        return image
+    scale = max_size / float(long_side)
+    size = (max(1, int(round(height * scale))), max(1, int(round(width * scale))))
+    return torch.nn.functional.interpolate(
+        image.unsqueeze(0), size=size, mode="bilinear", align_corners=False
+    ).squeeze(0)
+
+
+def lpips_patch_loss(lpips_model, image, target, mask2d, max_size, blurrer):
+    bbox = mask_to_bbox(mask2d)
+    cropped_image = crop_using_bbox(image, bbox)
+    cropped_target = crop_using_bbox(target, bbox)
+    cropped_image = resize_long_side(cropped_image, max_size)
+    cropped_target = resize_long_side(cropped_target, max_size)
+
+    if min(cropped_image.shape[-2:]) <= 64:
+        padding = (64, 64, 64, 64)
+        cropped_target = torch.nn.functional.pad(cropped_target, padding)
+        cropped_image = torch.nn.functional.pad(cropped_image, padding)
+
+    cropped_target = blurrer(cropped_target)
+    cropped_image = blurrer(cropped_image)
+    rendering_patches = divide_into_patches(cropped_image[None, ...], 2)
+    gt_patches = divide_into_patches(cropped_target[None, ...], 2)
+    return lpips_model(rendering_patches.squeeze() * 2 - 1, gt_patches.squeeze() * 2 - 1).mean()
+
+
+def sampled_object_loss(classifier, objects, gt_obj, cls_criterion, selected_obj_ids=None, max_pixels=0, exclude_selected=False):
+    max_pixels = int(max_pixels or 0)
+    num_classes = classifier.weight.shape[0]
+    normalizer = torch.log(torch.tensor(float(num_classes), device=objects.device))
+
+    if max_pixels <= 0:
+        logits = classifier(objects)
+        per_pixel = cls_criterion(logits.unsqueeze(0), gt_obj.unsqueeze(0)).squeeze()
+        if exclude_selected and selected_obj_ids is not None:
+            valid_mask = ~object_id_mask(gt_obj, selected_obj_ids)
+            return (per_pixel * valid_mask).mean() / normalizer
+        return per_pixel.mean() / normalizer
+
+    flat_objects = objects.reshape(objects.shape[0], -1)
+    flat_gt = gt_obj.reshape(-1).long()
+    valid_mask = torch.ones_like(flat_gt, dtype=torch.bool)
+    if exclude_selected and selected_obj_ids is not None:
+        valid_mask = ~object_id_mask(flat_gt, selected_obj_ids)
+
+    valid_indices = torch.nonzero(valid_mask, as_tuple=False).squeeze(1)
+    if valid_indices.numel() == 0:
+        return objects.sum() * 0.0
+
+    valid_ratio = valid_mask.float().mean().detach() if exclude_selected else 1.0
+    if valid_indices.numel() > max_pixels:
+        choice = torch.randperm(valid_indices.numel(), device=valid_indices.device)[:max_pixels]
+        valid_indices = valid_indices[choice]
+
+    sampled_objects = flat_objects[:, valid_indices]
+    weight = classifier.weight.squeeze(-1).squeeze(-1)
+    logits = weight @ sampled_objects
+    if classifier.bias is not None:
+        logits = logits + classifier.bias[:, None]
+    per_pixel = cls_criterion(logits.transpose(0, 1), flat_gt[valid_indices])
+    return per_pixel.mean() * valid_ratio / normalizer
+
+
+def sampled_reg3d_loss(gaussians, classifier, opt):
+    xyz = gaussians._xyz.squeeze().detach()
+    objects_dc = gaussians._objects_dc
+    max_points = int(getattr(opt, "reg3d_max_points", 0) or 0)
+    if max_points > 0 and xyz.shape[0] > max_points:
+        indices = torch.randperm(xyz.shape[0], device=xyz.device)[:max_points]
+        xyz = xyz[indices]
+        objects_dc = objects_dc[indices]
+
+    logits3d = classifier(objects_dc.permute(2, 0, 1))
+    prob_obj3d = torch.softmax(logits3d, dim=0).squeeze().permute(1, 0)
+    return loss_cls_3d(
+        xyz,
+        prob_obj3d,
+        opt.reg3d_k,
+        opt.reg3d_lambda_val,
+        max(xyz.shape[0], 1),
+        opt.reg3d_sample_size,
+    )
+
+
+def get_init_points(cam, default_depth=False, custom_mask=None, return_all=False):
             
     print(cam.image_name)
     
@@ -287,7 +395,9 @@ def get_init_points(cam, default_depth=False, custom_mask = None):
     points = depth_image_to_point_cloud(depth, A, extrinsic, depth.shape, gt_image, mask2d)
     # print(points.shape)
     # input()
-    points_all = depth_image_to_point_cloud(depth, A, extrinsic, depth.shape, gt_image, torch.ones_like(mask2d))
+    points_all = None
+    if return_all:
+        points_all = depth_image_to_point_cloud(depth, A, extrinsic, depth.shape, gt_image, torch.ones_like(mask2d))
     # points_all = points
     # print(points.shape)
     # input()
@@ -380,6 +490,8 @@ def finetune_inpaint(is_pbr, pbr_kwargs, dataset, pipe, opt, model_path, iterati
         points = points[0]
     else:
         print("no any ref points")
+    if len(points) > 0:
+        points = limit_points(points, getattr(opt, "max_inpaint_init_points", 0), "inpaint init points")
     # points_all = torch.cat((all1, all2))
     # points = torch.cat((point2, point4, point5))
     # points_all = all1
@@ -401,7 +513,8 @@ def finetune_inpaint(is_pbr, pbr_kwargs, dataset, pipe, opt, model_path, iterati
     # write_point_cloud('./test_point_3.ply', point3)
     # write_point_cloud('./test_point_4.ply', point4)
     # write_point_cloud('./test_point_5.ply', point5)
-    write_point_cloud('./test_point_1.ply', points)
+    if _as_bool(getattr(opt, "debug_dump_init_points", False)):
+        write_point_cloud('./test_point_1.ply', points)
     # exit()
     # print()
 
@@ -416,8 +529,7 @@ def finetune_inpaint(is_pbr, pbr_kwargs, dataset, pipe, opt, model_path, iterati
     # print(opt.skip_init)
     # print(point.size())
     if opt.skip_init == "False":
-        choice_id =  torch.randperm(points.size(0))[:int(points.size(0))]
-        points_selected = points[choice_id]
+        points_selected = points
         gaussians.inpaint_setup(opt,mask3d, points_selected[:,:3], is_pbr=is_pbr)
         # gaussians.inpaint_setup(opt,mask3d, None, is_pbr=is_pbr)
     else:
@@ -449,6 +561,7 @@ def finetune_inpaint(is_pbr, pbr_kwargs, dataset, pipe, opt, model_path, iterati
     for param in LPIPS.parameters():
         param.requires_grad = False
     LPIPS.cuda()
+    blurrer = Trans.GaussianBlur(kernel_size=(9, 9), sigma=(5, 5))
 
     
     """
@@ -489,6 +602,8 @@ def finetune_inpaint(is_pbr, pbr_kwargs, dataset, pipe, opt, model_path, iterati
             else:
                 mask2d[0,0] = True
                 print("haha")
+        if torch.equal(mask2d.long(), torch.zeros_like(mask2d)):
+            mask2d[0,0] = True
 
         # viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
         
@@ -533,17 +648,17 @@ def finetune_inpaint(is_pbr, pbr_kwargs, dataset, pipe, opt, model_path, iterati
             P[0:3,0:3] = R
             P[3,0:3] = T
             P[3,3] = 1
-            A = torch.Tensor([[f_x, 0, c_x],
+            A = torch.tensor([[f_x, 0, c_x],
                             [0, f_y, c_y],
-                            [0,0,1.0]]).to(image.device)
+                            [0,0,1.0]], device=image.device)
             # print(mask_index[0].shape)
             extrinsic = viewpoint_cam.camera_back_project
-            wtc_project = viewpoint_cam.world_view_transform.T
+            wtc_project = viewpoint_cam.world_view_transform.T.to(image.device)
             # print(T)
             if points_all != None:
-                target_point_ref, depth_ref = world_to_new_view(points_all, A, torch.Tensor(wtc_project).to(image.device), return_depth=True)
+                target_point_ref = world_to_new_view(points_all, A, wtc_project)
             else:
-                target_point_ref, depth_ref = world_to_new_view(points, A, torch.Tensor(wtc_project).to(image.device), return_depth=True)
+                target_point_ref = world_to_new_view(points, A, wtc_project)
 
             # target_point_ref = world_to_new_view(points, A, torch.Tensor(P.T).to(image.device))
             # print(target_point_ref.shape)
@@ -552,7 +667,7 @@ def finetune_inpaint(is_pbr, pbr_kwargs, dataset, pipe, opt, model_path, iterati
             # print(depth_ref)
             # input()
             gt_image = viewpoint_cam.original_image.cuda()
-            gt_swap_temp = gt_image.clone().detach().permute(1,2,0)
+            is_ref_view = (cam_name in ref_view_name) and (depth.shape[0] > 3)
             gt_swap = gt_image.clone().detach().permute(1,2,0)
             # print(gt_swap.shape)
             # input()
@@ -561,10 +676,8 @@ def finetune_inpaint(is_pbr, pbr_kwargs, dataset, pipe, opt, model_path, iterati
             # print(gt_image.shape)
             b1, b2, b3, b4 = (target_point_ref[:,0]<=(gt_image.shape[2]-1)), (target_point_ref[:,0]>=0), (target_point_ref[:,1]<=(gt_image.shape[1]-1)), (target_point_ref[:,1]>=0)
             selected = (b1*b2*b3*b4).nonzero(as_tuple=True)[0]
-            target_point_ref_clone = target_point_ref.detach().clone()[selected]
-            depth_ref_clone = depth_ref.detach().clone()[selected].unsqueeze(-1).repeat(1,3)
-            depth_swap = (torch.ones_like(depth[:3])*1000000.0).permute(1,2,0)
-            swap_index = target_point_ref_clone.clone().long()[:,:2].T
+            target_point_ref_clone = target_point_ref.detach()[selected]
+            swap_index = target_point_ref_clone.long()[:,:2].T
 
 
 
@@ -599,40 +712,18 @@ def finetune_inpaint(is_pbr, pbr_kwargs, dataset, pipe, opt, model_path, iterati
 
             
             
-            # print(image.shape, gt_image.shape, mask2d.shape)
-            # print(image.device, gt_image.device, mask2d.device)
-            Ll1 = masked_l1_loss(image, gt_image, ~mask2d)
-            
-            # del gt_image
-
-            # print('haha')
-            # print(mask2d.shape)
-            # print(mask2d)
-
-            bbox = mask_to_bbox(mask2d)
-            # print(bbox)
-            cropped_image = crop_using_bbox(image, bbox)
-            cropped_gt_image = crop_using_bbox(gt_swap, bbox)
-
-            if min(cropped_image.size()) <= 64:
-                pd64 = (64,64,64,64)
-                cropped_gt_image = torch.nn.functional.pad(cropped_gt_image, pd64)
-                cropped_image = torch.nn.functional.pad(cropped_image, pd64)
-            
-            blurrer = Trans.GaussianBlur(kernel_size=(9, 9), sigma=(5, 5))
-            # blurrer = Trans.GaussianBlur(kernel_size=(3, 3), sigma=(1, 1))
-            cropped_gt_image = blurrer(cropped_gt_image)
-            cropped_image = blurrer(cropped_image)
-            
-
-            # print(cropped_image.shape)
-
-            # torchvision.utils.save_image((gt_swap).detach().cpu(), 'test_{}.png'.format(iteration))
-            K = 2
-            rendering_patches = divide_into_patches(cropped_image[None, ...], K)
-            gt_patches = divide_into_patches(cropped_gt_image[None, ...], K)
-            # print(gt_patches.shape)
-            lpips_loss = LPIPS(rendering_patches.squeeze()*2-1,gt_patches.squeeze()*2-1).mean()
+            Ll1 = None
+            lpips_loss = None
+            if not is_ref_view:
+                Ll1 = masked_l1_loss(image, gt_image, ~mask2d)
+                lpips_loss = lpips_patch_loss(
+                    LPIPS,
+                    image,
+                    gt_swap,
+                    mask2d,
+                    getattr(opt, "lpips_max_size", 0),
+                    blurrer,
+                )
 
 
             ### semantic loss (calculate only if original object mask and gt image are available)
@@ -641,21 +732,21 @@ def finetune_inpaint(is_pbr, pbr_kwargs, dataset, pipe, opt, model_path, iterati
             # print(opt.reg3d_interval)
             if depth.shape[0] > 3:
                 gt_obj = depth[-1].long().cuda()
-                # gt_obj = (gt_obj * (~(gt_obj == selected_obj_ids[0])))
-                logits = classifier(objects)
-                # print(logits.shape)
-                # print(cls_criterion(logits.unsqueeze(0), gt_obj.unsqueeze(0)).shape)
-                # input()
-                loss_obj = (cls_criterion(logits.unsqueeze(0), gt_obj.unsqueeze(0)).squeeze()*(~object_id_mask(gt_obj, selected_obj_ids))).mean()
-                loss_obj = loss_obj / torch.log(torch.tensor(logits.shape[0]))
+                loss_obj = sampled_object_loss(
+                    classifier,
+                    objects,
+                    gt_obj,
+                    cls_criterion,
+                    selected_obj_ids=selected_obj_ids,
+                    max_pixels=getattr(opt, "object_loss_max_pixels", 0),
+                    exclude_selected=True,
+                )
 
                 ### reg_loss_3d
                 loss_obj_3d = 0
                 if iteration % opt.reg3d_interval == 0:
                     # regularize at certain intervals
-                    logits3d = classifier(gaussians._objects_dc.permute(2,0,1))
-                    prob_obj3d = torch.softmax(logits3d,dim=0).squeeze().permute(1,0)
-                    loss_obj_3d = loss_cls_3d(gaussians._xyz.squeeze().detach(), prob_obj3d, opt.reg3d_k, opt.reg3d_lambda_val, opt.reg3d_max_points, opt.reg3d_sample_size)
+                    loss_obj_3d = sampled_reg3d_loss(gaussians, classifier, opt)
                     # print('sssss')
                 else:
                     loss_obj_3d = 0
@@ -666,7 +757,7 @@ def finetune_inpaint(is_pbr, pbr_kwargs, dataset, pipe, opt, model_path, iterati
             # print(depth.shape)
             # input()
 
-            if (cam_name in ref_view_name) and (depth.shape[0] > 3):
+            if is_ref_view:
                 # print(image.shape)
                 if is_pbr:
                     loss_2d = masked_l1_loss(render_pkg["pbr"],depth[3:6], mask2d)
@@ -675,14 +766,8 @@ def finetune_inpaint(is_pbr, pbr_kwargs, dataset, pipe, opt, model_path, iterati
                 else:
                     loss_2d = l1_loss(image,depth[3:6])
                 
-                
-                print(loss_2d)
-                # loss_2d += loss_depth * 0.1 
-                print(loss_depth)
-                
                 if _use_ref == True:
                     loss_2d = loss_2d*1.0
-                torchvision.utils.save_image((depth[3:6]).detach().cpu(), 'test_gt.png')
                 
             else:
                 loss_2d = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * lpips_loss
@@ -735,9 +820,14 @@ def finetune_inpaint(is_pbr, pbr_kwargs, dataset, pipe, opt, model_path, iterati
             if depth.shape[0] > 3:
                 gt_obj = depth[-1].long().cuda()
             
-            logits = classifier(objects)
-            loss_obj = cls_criterion(logits.unsqueeze(0), gt_obj.unsqueeze(0)).squeeze().mean()
-            loss_obj = loss_obj / torch.log(torch.tensor(logits.shape[0]))  # normalize to (0,1)
+            loss_obj = sampled_object_loss(
+                classifier,
+                objects,
+                gt_obj,
+                cls_criterion,
+                max_pixels=getattr(opt, "object_loss_max_pixels", 0),
+                exclude_selected=False,
+            )
 
             loss_obj_3d = 0
 
@@ -752,9 +842,7 @@ def finetune_inpaint(is_pbr, pbr_kwargs, dataset, pipe, opt, model_path, iterati
                 loss_2d = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * lpips_loss
             if iteration % opt.reg3d_interval == 0:
                 # regularize at certain intervals
-                logits3d = classifier(gaussians._objects_dc.permute(2,0,1))
-                prob_obj3d = torch.softmax(logits3d,dim=0).squeeze().permute(1,0)
-                loss_obj_3d = loss_cls_3d(gaussians._xyz.squeeze().detach(), prob_obj3d, opt.reg3d_k, opt.reg3d_lambda_val, opt.reg3d_max_points, opt.reg3d_sample_size)
+                loss_obj_3d = sampled_reg3d_loss(gaussians, classifier, opt)
                 loss = loss_2d + (loss_obj*0.5 + loss_obj_3d)
             else:
                 loss = loss_2d + loss_obj*0.5
@@ -763,7 +851,7 @@ def finetune_inpaint(is_pbr, pbr_kwargs, dataset, pipe, opt, model_path, iterati
             # tb_dict = render_pkg["tb_dict"]
             # loss += render_pkg["loss"]
             try:
-                loss.backward(retain_graph = True)
+                loss.backward()
                 with torch.no_grad():
                     if (iteration <= 2000) and (iteration != 0):
                         # Keep track of max radii in image-space for pruning
@@ -1066,6 +1154,10 @@ if __name__ == "__main__":
         args.reg3d_lambda_val = config.get("reg3d_lambda_val", 2)
         args.reg3d_max_points = config.get("reg3d_max_points", 300000)
         args.reg3d_sample_size = config.get("reg3d_sample_size", 1000)
+        args.max_inpaint_init_points = config.get("max_inpaint_init_points", 100000)
+        args.object_loss_max_pixels = config.get("object_loss_max_pixels", 65536)
+        args.lpips_max_size = config.get("lpips_max_size", 384)
+        args.debug_dump_init_points = _as_bool(config.get("debug_dump_init_points", 0))
     except:
         pass
 
