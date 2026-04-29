@@ -11,11 +11,11 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-../../siga26/output}"
 # scene_name|output_scene|workflow_config
 SCENE_CONFIGS=(
   # "figurines|figurines|configs/iterative_inpaint/workflow_figurines.json"
-  "bear|bear|configs/iterative_inpaint/workflow_bear.json"
-  "bonsai|bonsai|configs/iterative_inpaint/workflow_bonsai.json"
-  "scene_1|scene_1|configs/iterative_inpaint/workflow_scene_1.json"
-  "scene_5|scene_5|configs/iterative_inpaint/workflow_scene_5.json"
-  "scene_6|scene_6|configs/iterative_inpaint/workflow_scene_6.json"
+  # "bear|bear|configs/iterative_inpaint/workflow_bear.json"
+  # "bonsai|bonsai|configs/iterative_inpaint/workflow_bonsai.json"
+  "scene_1_colmap|scene_1|configs/iterative_inpaint/workflow_scene_1.json"
+  "scene_5_colmap|scene_5|configs/iterative_inpaint/workflow_scene_5.json"
+  "scene_6_colmap|scene_6|configs/iterative_inpaint/workflow_scene_6.json"
   "fruits|fruits|configs/iterative_inpaint/workflow_fruits.json"
 )
 

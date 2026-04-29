@@ -353,10 +353,19 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, objects_fol
         # input()
         # print(image_path)
         image = Image.open(image_path) if image_path is not None and os.path.exists(image_path) else None
-                
+
         if image is not None:
-            image = np.asarray(image)/255.0
+            image = np.asarray(image).astype(np.float32) / 255.0
+            if image.ndim == 2:
+                image = np.repeat(image[..., None], 3, axis=-1)
             mask = np.ones_like(image[..., 0])
+            if image.shape[-1] == 4:
+                alpha = image[..., 3]
+                bg = np.zeros(3, dtype=image.dtype)
+                image = image[..., :3] * alpha[..., None] + bg * (1.0 - alpha[..., None])
+                mask = alpha
+            elif image.shape[-1] > 3:
+                image = image[..., :3]
         else:
             mask = None
 
