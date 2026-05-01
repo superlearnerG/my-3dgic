@@ -8,7 +8,7 @@ from utils.graphics_utils import getWorld2View2, getProjectionMatrix, getProject
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, fx, fy, cx, cy, image, objects, image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device="cuda", hdr=False,
-                 height=None, width=None, depth=None, normal=None, image_mask=None, depths=None):
+                 height=None, width=None, depth=None, normal=None, image_mask=None, depths=None, depth_loss=None):
         super(Camera, self).__init__()
 
         self.uid = uid
@@ -53,6 +53,22 @@ class Camera(nn.Module):
             self.image_mask = image_mask
         else:
             self.image_mask = torch.ones_like(self.depth)
+
+        self.depth_loss = None
+        self.depth_loss_mask = None
+        self.depth_loss_reliable = False
+        if depth_loss is not None:
+            depth_loss = depth_loss.to(self.data_device).float()
+            if depth_loss.ndim == 2:
+                depth_loss = depth_loss.unsqueeze(0)
+            if depth_loss.shape[0] != 1:
+                depth_loss = depth_loss[:1]
+            valid_depth = torch.isfinite(depth_loss) & (depth_loss > 0.0)
+            valid_depth = valid_depth & (self.image_mask.to(self.data_device) > 0)
+            depth_loss = torch.where(valid_depth, depth_loss, torch.zeros_like(depth_loss))
+            self.depth_loss = depth_loss
+            self.depth_loss_mask = valid_depth.float()
+            self.depth_loss_reliable = bool(valid_depth.any().item())
 
         if objects is not None:
             self.objects = objects

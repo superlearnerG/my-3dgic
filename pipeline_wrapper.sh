@@ -13,9 +13,9 @@ SCENE_CONFIGS=(
   # "figurines|figurines|configs/iterative_inpaint/workflow_figurines.json"
   # "bear|bear|configs/iterative_inpaint/workflow_bear.json"
   # "bonsai|bonsai|configs/iterative_inpaint/workflow_bonsai.json"
-  "scene_1_colmap|scene_1|configs/iterative_inpaint/workflow_scene_1.json"
-  "scene_5_colmap|scene_5|configs/iterative_inpaint/workflow_scene_5.json"
-  "scene_6_colmap|scene_6|configs/iterative_inpaint/workflow_scene_6.json"
+  "scene_1_colmap|scene_1_colmap|configs/iterative_inpaint/workflow_scene_1.json"
+  "scene_5_colmap|scene_5_colmap|configs/iterative_inpaint/workflow_scene_5.json"
+  "scene_6_colmap|scene_6_colmap|configs/iterative_inpaint/workflow_scene_6.json"
   "fruits|fruits|configs/iterative_inpaint/workflow_fruits.json"
 )
 
@@ -205,3 +205,6 @@ else
     run_custom_entry "$entry"
   done
 fi
+
+
+# 直接加 --use_depth_loss 就行了，pipeline.sh 里会覆盖默认值，没必要在这里加一个环境变量了

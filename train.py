@@ -8,7 +8,7 @@ from utils.loss_utils import ssim, loss_cls_3d
 from gaussian_renderer import render_fn_dict
 import sys
 from scene import Scene, GaussianModel
-from utils.general_utils import safe_state
+from utils.general_utils import get_expon_lr_func, safe_state
 from tqdm import tqdm
 from utils.image_utils import psnr, visualize_depth
 from utils.system_utils import prepare_output_and_logger
@@ -81,6 +81,31 @@ def clear_eval_image_dir(directory):
     for filename in os.listdir(directory):
         if os.path.splitext(filename)[1].lower() in EVAL_IMAGE_EXTENSIONS:
             os.remove(os.path.join(directory, filename))
+
+
+def compute_depth_loss(render_pkg, viewpoint_cam, depth_l1_weight_value, use_depth_loss):
+    if not use_depth_loss or depth_l1_weight_value <= 0 or not getattr(viewpoint_cam, "depth_loss_reliable", False):
+        return torch.tensor(0.0, device=render_pkg["render"].device), 0.0
+
+    target_depth = getattr(viewpoint_cam, "depth_loss", None)
+    target_mask = getattr(viewpoint_cam, "depth_loss_mask", None)
+    if target_depth is None or target_mask is None:
+        return torch.tensor(0.0, device=render_pkg["render"].device), 0.0
+
+    rendered_depth = render_pkg.get("depth", None)
+    rendered_opacity = render_pkg.get("opacity", None)
+    if rendered_depth is None or rendered_opacity is None:
+        return torch.tensor(0.0, device=render_pkg["render"].device), 0.0
+
+    render_device = render_pkg["render"].device
+    target_depth = target_depth.to(render_device)
+    target_mask = target_mask.to(render_device)
+    target_invdepth = torch.where(target_mask > 0, 1.0 / target_depth.clamp_min(1e-6), torch.zeros_like(target_depth))
+    pred_invdepth = rendered_opacity / rendered_depth.clamp_min(1e-6)
+    valid_pixels = target_mask.sum().clamp_min(1.0)
+    depth_l1 = (torch.abs(pred_invdepth - target_invdepth) * target_mask).sum() / valid_pixels
+    depth_loss = depth_l1_weight_value * depth_l1
+    return depth_loss, depth_loss.item()
 
 
 def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams, is_pbr=False, save_iteration=[1_000, 7_000, 30_000, 60_000]):
@@ -182,6 +207,10 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
     """ Training """
     viewpoint_stack = None
     ema_dict_for_log = defaultdict(int)
+    use_depth_loss = getattr(dataset, "use_depth_loss", False)
+    depth_l1_weight = get_expon_lr_func(
+        opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations
+    ) if use_depth_loss else None
     progress_bar = tqdm(range(first_iter + 1, opt.iterations + 1), desc="Training progress",
                         initial=first_iter, total=opt.iterations)
 
@@ -232,6 +261,10 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
 
         # Loss
         tb_dict = render_pkg["tb_dict"]
+        if use_depth_loss:
+            depth_loss, Ll1depth = compute_depth_loss(render_pkg, viewpoint_cam, depth_l1_weight(iteration), use_depth_loss)
+            loss = loss + depth_loss
+            tb_dict["loss_depth"] = Ll1depth
         # loss += render_pkg["loss"]
         loss.backward()
 

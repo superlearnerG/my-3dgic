@@ -10,6 +10,26 @@ from utils.graphics_utils import focal2fov
 WARNED = False
 
 
+def _load_raw_depth_loss_tensor(depth_path, resolution, depth_scale):
+    raw_depth = np.load(depth_path)
+    raw_depth = np.asarray(raw_depth)
+    if raw_depth.ndim == 3:
+        if raw_depth.shape[-1] == 1:
+            raw_depth = raw_depth[..., 0]
+        elif raw_depth.shape[0] == 1:
+            raw_depth = raw_depth[0]
+        else:
+            raise ValueError(f"Expected a single-channel raw depth map at '{depth_path}', got shape {raw_depth.shape}.")
+    if raw_depth.ndim != 2:
+        raise ValueError(f"Expected a 2D raw depth map at '{depth_path}', got shape {raw_depth.shape}.")
+
+    raw_depth = raw_depth.astype(np.float32, copy=False)
+    raw_depth = np.where(np.isfinite(raw_depth) & (raw_depth > 0.0), raw_depth, 0.0)
+    depth = torch.from_numpy((raw_depth * float(depth_scale)).astype(np.float32, copy=False)).unsqueeze(0)
+    return torchvision.transforms.Resize(
+        resolution, interpolation=InterpolationMode.BILINEAR, antialias=True)(depth)
+
+
 def loadCam(args, id, cam_info, resolution_scale):
     orig_h, orig_w = cam_info.image.shape[:2]
 
@@ -45,6 +65,12 @@ def loadCam(args, id, cam_info, resolution_scale):
         resized_depth = torchvision.transforms.Resize(
             resolution, interpolation=InterpolationMode.NEAREST)(depth)
 
+    resized_depth_loss = None
+    depth_loss_path = getattr(cam_info, "depth_loss_path", "")
+    if depth_loss_path:
+        resized_depth_loss = _load_raw_depth_loss_tensor(
+            depth_loss_path, resolution, getattr(cam_info, "depth_loss_scale", 1.0))
+
     resized_normal = None
     if cam_info.normal is not None:
         normal = torch.from_numpy(cam_info.normal).float().permute(2, 0, 1)
@@ -79,12 +105,14 @@ def loadCam(args, id, cam_info, resolution_scale):
         return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, fx=scale_fx, fy=scale_fy, cx=scale_cx, cy=scale_cy,
                   image=gt_image, depth=resized_depth, normal=resized_normal, image_mask=resized_image_mask, objects=resized_objects,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device, hdr=cam_info.hdr, depths =torch.from_numpy(np.array(cam_info.depths)))
+                  image_name=cam_info.image_name, uid=id, data_device=args.data_device, hdr=cam_info.hdr,
+                  depths=torch.from_numpy(np.array(cam_info.depths)), depth_loss=resized_depth_loss)
     else:
         return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, fx=scale_fx, fy=scale_fy, cx=scale_cx, cy=scale_cy,
                   image=gt_image, depth=resized_depth, normal=resized_normal, image_mask=resized_image_mask, objects=resized_objects,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device, hdr=cam_info.hdr)
+                  image_name=cam_info.image_name, uid=id, data_device=args.data_device, hdr=cam_info.hdr,
+                  depth_loss=resized_depth_loss)
 
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):

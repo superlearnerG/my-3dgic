@@ -29,6 +29,11 @@ LAMBDA_MASK_ENTROPY=0.1
 SAVE_TRAINING_VIS=1
 SAVE_TRAINING_VIS_ITERATION=1000
 EVAL=1
+USE_DEPTH_LOSS=0
+DEPTHS=""
+DEPTH_SCALE=0.0
+DEPTH_L1_WEIGHT_INIT=1.0
+DEPTH_L1_WEIGHT_FINAL=0.01
 
 TOP_K_REF_VIEWS=""
 SIMPLE_LAMA_DEVICE="${SIMPLE_LAMA_DEVICE:-}"
@@ -82,6 +87,11 @@ Training options:
   --densification_interval <int>     Default: 500.
   --lambda_normal_render_depth <v>   Default: 0.01.
   --lambda_mask_entropy <v>          Default: 0.1.
+  --use_depth_loss                   Enable raw .npy inverse-depth supervision during base training.
+  --depths <path>                    Raw .npy depth folder. Default when enabled: <source_path>/depth.
+  --depth_scale <v>                  Raw-depth to COLMAP/3DGIC scale. Default: 0.0, estimate from COLMAP tracks.
+  --depth_l1_weight_init <v>         Initial inverse-depth loss weight. Default: 1.0.
+  --depth_l1_weight_final <v>        Final inverse-depth loss weight. Default: 0.01.
   --no_eval                          Do not pass --eval to train.py.
   --no_save_training_vis             Do not save training visualization grids.
   --save_training_vis_iteration <n>  Default: 1000.
@@ -212,6 +222,26 @@ while [[ $# -gt 0 ]]; do
       ;;
     --lambda_mask_entropy)
       LAMBDA_MASK_ENTROPY="$2"
+      shift 2
+      ;;
+    --use_depth_loss)
+      USE_DEPTH_LOSS=1
+      shift
+      ;;
+    --depths)
+      DEPTHS="$2"
+      shift 2
+      ;;
+    --depth_scale)
+      DEPTH_SCALE="$2"
+      shift 2
+      ;;
+    --depth_l1_weight_init)
+      DEPTH_L1_WEIGHT_INIT="$2"
+      shift 2
+      ;;
+    --depth_l1_weight_final)
+      DEPTH_L1_WEIGHT_FINAL="$2"
       shift 2
       ;;
     --no_eval)
@@ -361,6 +391,18 @@ run_train() {
 
   if (( EVAL )); then
     train_args+=(--eval)
+  fi
+  if (( USE_DEPTH_LOSS )); then
+    if [[ -z "$DEPTHS" ]]; then
+      DEPTHS="$SOURCE_PATH/depth"
+    fi
+    train_args+=(
+      --use_depth_loss
+      --depths "$DEPTHS"
+      --depth_scale "$DEPTH_SCALE"
+      --depth_l1_weight_init "$DEPTH_L1_WEIGHT_INIT"
+      --depth_l1_weight_final "$DEPTH_L1_WEIGHT_FINAL"
+    )
   fi
   if (( SAVE_TRAINING_VIS )); then
     train_args+=(--save_training_vis --save_training_vis_iteration "$SAVE_TRAINING_VIS_ITERATION")

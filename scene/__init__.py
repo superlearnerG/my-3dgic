@@ -43,7 +43,10 @@ class Scene:
         print(os.path.join(args.source_path, "inputs/sfm_scene.json"))
         if os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, object_path=args.object_path,
-                                                          debug=args.debug_cuda)
+                                                          debug=args.debug_cuda,
+                                                          use_depth_loss=getattr(args, "use_depth_loss", False),
+                                                          depths=getattr(args, "depths", ""),
+                                                          depth_scale=getattr(args, "depth_scale", 0.0))
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval,
