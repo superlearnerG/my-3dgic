@@ -141,6 +141,28 @@ fail() {
   exit 1
 }
 
+write_time_consuming() {
+  local end_time end_text elapsed hours minutes seconds elapsed_hms output_path
+  end_time="$(date +%s)"
+  end_text="$(date '+%F %T')"
+  elapsed=$((end_time - PIPELINE_START_TIME))
+  hours=$((elapsed / 3600))
+  minutes=$(((elapsed % 3600) / 60))
+  seconds=$((elapsed % 60))
+  printf -v elapsed_hms "%02d:%02d:%02d" "$hours" "$minutes" "$seconds"
+  mkdir -p "$MODEL_PATH"
+  output_path="$MODEL_PATH/time_consuming.txt"
+  {
+    printf 'source_path: %s\n' "$SOURCE_PATH"
+    printf 'model_path: %s\n' "$MODEL_PATH"
+    printf 'start_time: %s\n' "$PIPELINE_START_TEXT"
+    printf 'end_time: %s\n' "$end_text"
+    printf 'elapsed_seconds: %d\n' "$elapsed"
+    printf 'elapsed_hms: %s\n' "$elapsed_hms"
+  } > "$output_path"
+  echo "[$end_text] Total pipeline time: $elapsed_hms ($elapsed seconds). Wrote $output_path"
+}
+
 append_target_ids() {
   local raw="$1"
   local part
@@ -351,6 +373,9 @@ for target_id in "${TARGET_IDS[@]}"; do
   [[ "$target_id" =~ ^[0-9]+$ ]] || fail "target id must be a non-negative integer: $target_id"
 done
 
+PIPELINE_START_TIME="$(date +%s)"
+PIPELINE_START_TEXT="$(date '+%F %T')"
+
 ensure_model_ready() {
   [[ -d "$MODEL_PATH/point_cloud" ]] || fail "trained point_cloud directory not found: $MODEL_PATH/point_cloud"
 
@@ -521,6 +546,7 @@ fi
 
 run_rounds
 run_status
+write_time_consuming
 
 
 # 用法
